@@ -14,14 +14,6 @@ A recurrent Variational Autoencoder for nanobody backbone torsion angles (phi, p
 ├── structural_analysis.py   # Dataset characterisation (Ramachandran, omega, CDR3)
 ├── prep.py                  # Raw PDB → filtered CSV preprocessing
 ├── run_pipeline.py          # End-to-end pipeline: train → diagnostics → UMAP
-├── experiments/             # Auto-generated run directories (gitignored)
-│   └── run_YYYYMMDD_XXXXXX/
-│       ├── config.json
-│       ├── vae_checkpoint.pt
-│       ├── training_curves.png
-│       ├── diag_*.png
-│       ├── umap_colorings.png
-│       └── ...
 ├── nanobodies_filtered.csv  # Processed dataset (see Data section)
 └── nanobody_summary.tsv     # Metadata (species, antigen, subclass, resolution)
 ```
