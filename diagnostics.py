@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 import torch.distributions as dist
 import pyro
-from pyro.infer import TraceMeanField_ELBO
+from pyro.infer import Trace_ELBO
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -48,13 +48,14 @@ def _latest_run():
     exp_dir = 'experiments'
     if not os.path.isdir(exp_dir):
         raise FileNotFoundError("No 'experiments/' directory. Run vae.py first.")
-    runs = sorted(
+    runs = [
         d for d in os.listdir(exp_dir)
         if os.path.isdir(os.path.join(exp_dir, d))
         and os.path.exists(os.path.join(exp_dir, d, 'vae_checkpoint.pt'))
-    )
+    ]
     if not runs:
         raise FileNotFoundError("No checkpoint found in experiments/. Run vae.py first.")
+    runs.sort(key=lambda d: os.path.getmtime(os.path.join(exp_dir, d)))
     return runs[-1]
 
 
@@ -92,8 +93,8 @@ def collect_latents(vae, loader, device, beta):
 
 @torch.no_grad()
 def compute_elbo_loss(vae, loader, device, beta, train_mode):
-    """Negative ELBO (TraceMeanField) in train or eval mode."""
-    elbo = TraceMeanField_ELBO()
+    """Negative ELBO (Trace_ELBO) in train or eval mode."""
+    elbo = Trace_ELBO()
     if train_mode:
         vae.train()
     else:
@@ -249,7 +250,7 @@ def plot_loss_modes(vae, train_loader, val_loader, device, beta):
     colors = ["#3498db", "#85c1e9", "#e74c3c", "#f1948a"]
     bars = ax.bar(labels, values, color=colors, alpha=0.85, width=0.5)
     ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
-    ax.set_ylabel("Negative ELBO (TraceMeanField, per sample)")
+    ax.set_ylabel("Negative ELBO (Trace_ELBO, per sample)")
     ax.set_title("Loss breakdown: train vs val in train mode and eval mode",
                  fontsize=10, fontweight="bold")
     ax.tick_params(axis="x", labelsize=8)
@@ -373,7 +374,7 @@ def plot_generated_ramachandran(vae, val_loader, device):
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     fig.suptitle(
-        f"Generated Ramachandran Plot  (z ~ N(0,I), prior samples)\n"
+        f"Generated Ramachandran Plot  (z ~ MAF prior samples)\n"
         f"Wasserstein-1 — φ: {w1_phi:.3f}°   ψ: {w1_psi:.3f}°",
         fontsize=11, fontweight="bold",
     )
@@ -383,7 +384,7 @@ def plot_generated_ramachandran(vae, val_loader, device):
 
     for ax, phi, psi, title in [
         (axes[0], real_phi, real_psi, "Real angles"),
-        (axes[1], gen_phi,  gen_psi,  "Generated angles  (z ~ N(0,I))"),
+        (axes[1], gen_phi,  gen_psi,  "Generated angles  (z ~ MAF prior)"),
     ]:
         hb = ax.hexbin(phi, psi, **hex_kw)
         fig.colorbar(hb, ax=ax, label="Count")
@@ -474,7 +475,7 @@ def write_report(active, kl_mean, loss_results, mae_phi, mae_psi,
         lines.append("  ✓ No posterior holes detected — aggregate posterior ≈ N(0,1).")
 
     lines += ["", "6. GENERATION QUALITY", "-" * 40]
-    lines += ["  Wasserstein-1 (real vs generated angle distribution):"]
+    lines += ["  Wasserstein-1 (real vs generated angle distribution, z ~ MAF prior):"]
     lines += [f"    φ: {w1_phi_gen:.3f}°",
               f"    ψ: {w1_psi_gen:.3f}°",
               "  (lower is better; ~0 = generated matches real distribution)"]
@@ -521,8 +522,22 @@ def main():
     train_loader = dataset.get_dataloader(tr_idx, batch_size=32, shuffle=False)
     val_loader   = dataset.get_dataloader(v_idx,  batch_size=32, shuffle=False)
 
+    config_path = os.path.join(run_dir, 'config.json')
+    if os.path.exists(config_path):
+        import json
+        with open(config_path) as f:
+            cfg = json.load(f)
+        warmup_epochs = cfg.get('warmup_epochs', 70)
+        anneal_end    = cfg.get('anneal_end', 200)
+        max_beta      = cfg.get('max_beta', 0.01)
+    else:
+        warmup_epochs, anneal_end, max_beta = 70, 200, 0.01
+
     last_epoch = ckpt.get("epoch", 149)
-    beta       = get_beta_schedule(last_epoch)
+    beta       = get_beta_schedule(last_epoch,
+                                   warmup_epochs=warmup_epochs,
+                                   anneal_end=anneal_end,
+                                   max_beta=max_beta)
     print(f"Using β = {beta:.3f}  (epoch {last_epoch+1})\n")
 
     # Collect posterior parameters via Pyro guide traces
