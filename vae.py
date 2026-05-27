@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 from torch.nn.utils.rnn import pack_padded_sequence
 import matplotlib.pyplot as plt
-
+import zuko
+from pyro.contrib.zuko import ZukoToPyro
 
 # ============================================================================
 # CONSTANTS
@@ -64,6 +65,13 @@ class NanobodyVAE(nn.Module):
         self.fc_out       = nn.Linear(hidden_dim, input_dim)
         self.fc_kappa_out = nn.Linear(hidden_dim, input_dim)
 
+        # PRIOR: learnable MAF flow p(z)
+        self.prior = zuko.flows.MAF(
+            features=latent_dim,
+            hidden_features=[hidden_dim, hidden_dim],
+            transforms=3,
+        ).to(device)
+        
     def encode(self, x, seq_lengths):
         packed = pack_padded_sequence(x, seq_lengths.cpu(),
                                       batch_first=True, enforce_sorted=False)
@@ -87,13 +95,7 @@ class NanobodyVAE(nn.Module):
 
         with pyro.plate("data", batch_size):
             with pyro.poutine.scale(scale=beta):
-                z = pyro.sample(
-                    "z",
-                    pyrodist.Normal(
-                        x.new_zeros(batch_size, self.latent_dim),
-                        x.new_ones(batch_size, self.latent_dim),
-                    ).to_event(1),
-                )
+                z = pyro.sample("z", ZukoToPyro(self.prior()))
 
             mu_x, kappa_x = self.decode(z, seq_len)
             mask = (torch.arange(seq_len, device=x.device)[None, :]
@@ -128,13 +130,7 @@ class NanobodyVAE(nn.Module):
         """
         self.eval()
         with pyro.plate("samples", num_samples):
-            z = pyro.sample(
-                "z_prior",
-                pyrodist.Normal(
-                    torch.zeros(self.latent_dim, device=self.device),
-                    torch.ones(self.latent_dim, device=self.device),
-                ).to_event(1),
-            )
+            z = pyro.sample("z_prior", ZukoToPyro(self.prior()))
         mu_x, kappa_x = self.decode(z, seq_len)
         angles = pyrodist.VonMises(mu_x, kappa_x).sample() if stochastic else mu_x
         return z.cpu(), angles.cpu()
@@ -147,7 +143,7 @@ class NanobodyVAE(nn.Module):
 def get_beta_schedule(epoch, warmup_epochs=70, anneal_end=200, max_beta=0.01):
     """beta-annealing: warm-up → gradual increase → plateau."""
     if epoch < warmup_epochs:
-        return 1e-4
+        return 1e-4    
     elif epoch < anneal_end:
         progress = (epoch - warmup_epochs) / (anneal_end - warmup_epochs)
         return 1e-4 + progress * (max_beta - 1e-4)
@@ -217,7 +213,7 @@ def train_vae(vae, train_loader, val_loader,
     optimizer = ClippedAdam({
         "lr":           lr,
         "weight_decay": weight_decay,
-        "clip_norm":    10.0,   # gradient clipping — important for RNNs
+        "clip_norm":    10.0,   # gradient clipping important for RNNs
     })
     svi = SVI(vae.model, vae.guide, optimizer, loss=Trace_ELBO())
 
@@ -365,7 +361,7 @@ def main():
     warmup_epochs = 50
     anneal_end    = 170
     max_beta      = 0.01
-    epochs        = 400
+    epochs        = 350
     patience      = 20
     batch_size    = 32
     lr            = 5e-4
