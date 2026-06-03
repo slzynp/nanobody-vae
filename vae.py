@@ -27,7 +27,8 @@ MAX_LEN    = 80
 N_ANGLES   = 2
 HIDDEN_DIM = 64
 LATENT_DIM = 32
-
+MIN_KAPPA = 40.0  # minimum concentration for Von Mises distribution
+MAX_KAPPA = 400.0 # maximum concentration for Von Mises distribution
 
 # ============================================================================
 # VAE MODEL  —  Gaussian prior + posterior, Von Mises likelihood
@@ -86,7 +87,7 @@ class NanobodyVAE(nn.Module):
 
         raw     = self.fc_out(rnn_out)
         mu_x    = torch.atan2(torch.sin(raw), torch.cos(raw))
-        kappa_x = F.softplus(self.fc_kappa_out(rnn_out)) + 1e-4
+        kappa_x = MIN_KAPPA + (MAX_KAPPA - MIN_KAPPA) * torch.sigmoid(self.fc_kappa_out(rnn_out))
         return mu_x, kappa_x
 
     def model(self, x, seq_lengths, beta):
@@ -115,7 +116,18 @@ class NanobodyVAE(nn.Module):
                 pyro.sample("z", pyrodist.Normal(mu_z, std).to_event(1))
 
     @torch.no_grad()
-    def generate(self, num_samples=100, seq_len=MAX_LEN, stochastic=True):
+    def reconstruction_loss(self, x, seq_lengths):
+        """Mean Von Mises NLL at posterior mean z (monitoring only)."""
+        mu_z, _ = self.encode(x, seq_lengths)
+        seq_len = x.size(1)
+        mu_x, kappa_x = self.decode(mu_z, seq_len)
+        mask = (torch.arange(seq_len, device=x.device)[None, :]
+                < seq_lengths[:, None]).float().unsqueeze(-1)
+        nll = -(dist.VonMises(mu_x, kappa_x).log_prob(x) * mask).sum(dim=[1, 2]) / seq_lengths.float()
+        return nll.mean().item()
+
+    @torch.no_grad()
+    def generate(self, num_samples=78, seq_len=MAX_LEN, stochastic=True):
         """Sample z ~ N(0, I) via the Pyro prior and decode to angle sequences.
 
         Args:
@@ -199,13 +211,14 @@ class NanobodyDataset(torch.utils.data.Dataset):
 # ============================================================================
 
 def train_vae(vae, train_loader, val_loader,
-              epochs=200, device='cpu', patience=20,
+              epochs=200, device='cpu',
               train_indices=None, val_indices=None,
               warmup_epochs=70, anneal_end=200, max_beta=0.01,
-              lr=5e-4, weight_decay=1e-5, save_dir='.'):
+              lr=5e-4, weight_decay=1e-5, save_dir='.',
+              patience=50):
 
     print(f"\n{'='*70}")
-    print("TRAINING NANOBODY VAE  (SVI, TraceMeanField_ELBO, Von Mises likelihood)")
+    print("TRAINING NANOBODY VAE  (SVI, Trace_ELBO, Von Mises likelihood)")
     print(f"{'='*70}\n")
 
     pyro.clear_param_store()
@@ -217,11 +230,11 @@ def train_vae(vae, train_loader, val_loader,
     })
     svi = SVI(vae.model, vae.guide, optimizer, loss=Trace_ELBO())
 
-    train_losses, val_losses, kl_values, beta_values = [], [], [], []
+    train_losses, val_losses, kl_values, beta_values, recon_losses = [], [], [], [], []
 
     best_val_loss    = float('inf')
-    patience_counter = 0
     best_epoch       = 0
+    patience_counter = 0
 
     for epoch in range(epochs):
         beta = get_beta_schedule(epoch, warmup_epochs=warmup_epochs,
@@ -267,11 +280,17 @@ def train_vae(vae, train_loader, val_loader,
         val_loss /= n_val
         val_kl   /= n_val
 
+        val_recon = sum(
+            vae.reconstruction_loss(x.to(device), sl.to(device))
+            for x, sl in val_loader
+        ) / len(val_loader)
+
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         kl_values.append(val_kl)
+        recon_losses.append(val_recon)
 
-        # ─── EARLY STOPPING ───
+        # ─── CHECKPOINT ───
         if val_loss < best_val_loss:
             best_val_loss    = val_loss
             best_epoch       = epoch
@@ -290,9 +309,8 @@ def train_vae(vae, train_loader, val_loader,
             patience_counter += 1
             print(f"Epoch {epoch+1:3d}: train={train_loss:.4f}, val={val_loss:.4f}, "
                   f"kl={val_kl:.4f}, beta={beta:.4f}")
-
             if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch+1}")
+                print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {patience} epochs).")
                 break
 
     print(f"\n{'='*70}")
@@ -302,22 +320,23 @@ def train_vae(vae, train_loader, val_loader,
     print(f"  Best val loss   : {best_val_loss:.4f}")
     print(f"{'='*70}\n")
 
-    return train_losses, val_losses, kl_values, beta_values
+    return train_losses, val_losses, kl_values, beta_values, recon_losses
 
 
 # ============================================================================
 # PLOTTING
 # ============================================================================
 
-def plot_training_results(train_losses, val_losses, kl_values, beta_values,
+def plot_training_results(train_losses, val_losses, kl_values, beta_values, recon_losses,
                           save_path="training_curves.png"):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     epochs = range(1, len(train_losses) + 1)
 
-    axes[0, 0].plot(epochs, train_losses, 'b-', label='Train', linewidth=2, marker='o', markersize=4)
-    axes[0, 0].plot(epochs, val_losses,   'r-', label='Val',   linewidth=2, marker='s', markersize=4)
-    axes[0, 0].set_xlabel('Epoch'); axes[0, 0].set_ylabel('Loss (ELBO)')
-    axes[0, 0].set_title('Training & Validation Loss'); axes[0, 0].legend(); axes[0, 0].grid(alpha=0.3)
+    axes[0, 0].plot(epochs, recon_losses, color='darkorange', linewidth=2, marker='o', markersize=4)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('NLL (nats/residue)')
+    axes[0, 0].set_title('Reconstruction Loss (Validation)')
+    axes[0, 0].grid(alpha=0.3)
 
     axes[0, 1].plot(epochs, kl_values, 'g-', linewidth=2, marker='o', markersize=4)
     axes[0, 1].set_xlabel('Epoch'); axes[0, 1].set_ylabel('KL Divergence')
@@ -360,9 +379,9 @@ def main():
     hidden_dim    = HIDDEN_DIM
     warmup_epochs = 50
     anneal_end    = 170
-    max_beta      = 0.01
-    epochs        = 350
-    patience      = 20
+    max_beta      = 0.1
+    epochs        = 1500
+    patience      = 100
     batch_size    = 32
     lr            = 5e-4
     weight_decay  = 1e-5
@@ -408,17 +427,17 @@ def main():
     print(f"  Optimizer  : ClippedAdam (SVI)")
     print(f"  Params     : {sum(p.numel() for p in vae.parameters()):,}\n")
 
-    train_losses, val_losses, kl_values, beta_values = train_vae(
+    train_losses, val_losses, kl_values, beta_values, recon_losses = train_vae(
         vae, train_loader, val_loader,
-        epochs=epochs, device=device, patience=patience,
+        epochs=epochs, device=device,
         train_indices=train_indices, val_indices=val_indices,
         warmup_epochs=warmup_epochs, anneal_end=anneal_end, max_beta=max_beta,
         lr=lr, weight_decay=weight_decay,
-        save_dir=save_dir,
+        save_dir=save_dir, patience=patience,
     )
 
     plot_training_results(
-        train_losses, val_losses, kl_values, beta_values,
+        train_losses, val_losses, kl_values, beta_values, recon_losses,
         save_path=os.path.join(save_dir, 'training_curves.png'),
     )
 
