@@ -28,10 +28,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.stats import wasserstein_distance, norm as scipy_norm
+from matplotlib.colors import LogNorm
 
 from vae_svi import (
     NanobodyVAE, NanobodyDataset,
     N_ANGLES, HIDDEN_DIM, LATENT_DIM,
+    MIN_KAPPA, MAX_KAPPA,
     collate_fn, get_beta_schedule,
 )
 
@@ -149,118 +151,7 @@ def plot_kl_per_dim(mu_z, lv_z):
     return active, kl_mean
 
 
-# ─── Plot 2: Aggregate posterior vs N(0,1) ───────────────────────────────────
-
-POSTERIOR_HOLE_THRESHOLD = 0.3
-
-def plot_aggregate_posterior(mu_z, save_path):
-    """Diagnose posterior holes by comparing the aggregate posterior to N(0,1)."""
-    mu_np = mu_z.numpy()
-    N, D  = mu_np.shape
-
-    rng         = np.random.default_rng(0)
-    ref_samples = rng.standard_normal(max(N, 10_000))
-    wasserstein_dists = np.array([
-        wasserstein_distance(mu_np[:, d], ref_samples)
-        for d in range(D)
-    ])
-
-    print("[Diag 2] Wasserstein-1 distance to N(0,1) per dimension:")
-    for d, w in enumerate(wasserstein_dists):
-        flag = "  ← HOLE" if w > POSTERIOR_HOLE_THRESHOLD else ""
-        print(f"  dim {d:2d}: W1 = {w:.4f}{flag}")
-
-    top5_idx = np.argsort(wasserstein_dists)[::-1][:5]
-    print("[Diag 2] Top 5 most deviant dimensions:")
-    for rank, d in enumerate(top5_idx):
-        print(f"  #{rank+1}: dim {d:2d}  W1={wasserstein_dists[d]:.4f}"
-              f"  mean={mu_np[:, d].mean():.3f}  std={mu_np[:, d].std():.3f}")
-
-    nrows_grid, ncols_grid = 4, 8
-    fig = plt.figure(figsize=(ncols_grid * 2.5, nrows_grid * 2.2 + 5))
-    gs  = fig.add_gridspec(
-        nrows_grid + 1, ncols_grid,
-        height_ratios=[2.2] * nrows_grid + [4.5],
-        hspace=0.55, wspace=0.35,
-    )
-
-    x_ref = np.linspace(-4, 4, 200)
-    y_ref = scipy_norm.pdf(x_ref)
-
-    for d in range(D):
-        ax = fig.add_subplot(gs[d // ncols_grid, d % ncols_grid])
-        ax.hist(mu_np[:, d], bins=30, density=True, color="#3498db",
-                alpha=0.70, edgecolor="white", linewidth=0.3)
-        ax.plot(x_ref, y_ref, "r-", lw=1.2)
-        ax.axvline(0, color="gray", lw=0.8, ls="--")
-        is_hole = wasserstein_dists[d] > POSTERIOR_HOLE_THRESHOLD
-        ax.set_title(f"z{d}  W={wasserstein_dists[d]:.2f}",
-                     fontsize=7,
-                     fontweight="bold" if is_hole else "normal",
-                     color="red"       if is_hole else "black")
-        ax.set_xticks([-3, 0, 3])
-        ax.tick_params(labelsize=6)
-        ax.set_yticks([])
-
-    ax_s  = fig.add_subplot(gs[nrows_grid, :])
-    dims  = np.arange(D)
-    width = 0.35
-    ax_s.bar(dims - width / 2, mu_np.mean(0), width,
-             label="mean(μ_z)", color="#e74c3c", alpha=0.80)
-    ax_s.bar(dims + width / 2, mu_np.std(0),  width,
-             label="std(μ_z)",  color="#2ecc71", alpha=0.80)
-    ax_s.axhline(0, color="red",   lw=1.0, ls="--", alpha=0.5)
-    ax_s.axhline(1, color="green", lw=1.5, ls="--", label="std = 1 (target)")
-    ax_s.set_xlabel("Latent dimension")
-    ax_s.set_ylabel("Value")
-    ax_s.set_title(
-        "Per-dimension mean and std of μ_z  (healthy: mean≈0, std≈1)",
-        fontsize=10, fontweight="bold",
-    )
-    ax_s.legend(fontsize=8)
-    ax_s.set_xticks(dims)
-    ax_s.tick_params(axis="x", labelsize=7)
-
-    fig.suptitle(
-        "Aggregate Posterior vs N(0,1) Prior — Posterior Hole Diagnosis\n"
-        "(red title = W1 > 0.3, red curve = N(0,1) reference)",
-        fontsize=12, fontweight="bold",
-    )
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[Diag 2] Aggregate posterior plot saved → {save_path}")
-    return wasserstein_dists
-
-
-# ─── Plot 3: Train vs Val — train-mode vs eval-mode ──────────────────────────
-
-def plot_loss_modes(vae, train_loader, val_loader, device, beta):
-    print("[Diag 3] Computing train/val losses in train and eval mode (takes a moment)...")
-    results = {}
-    for split, loader in [("Train", train_loader), ("Val", val_loader)]:
-        for mode_label, train_mode in [("train_mode", True),
-                                        ("eval_mode ", False)]:
-            loss = compute_elbo_loss(vae, loader, device, beta, train_mode)
-            results[f"{split} / {mode_label}"] = loss
-            print(f"  {split:5s} {mode_label}: {loss:.4f}")
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    labels = list(results.keys())
-    values = list(results.values())
-    colors = ["#3498db", "#85c1e9", "#e74c3c", "#f1948a"]
-    bars = ax.bar(labels, values, color=colors, alpha=0.85, width=0.5)
-    ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
-    ax.set_ylabel("Negative ELBO (Trace_ELBO, per sample)")
-    ax.set_title("Loss breakdown: train vs val in train mode and eval mode",
-                 fontsize=10, fontweight="bold")
-    ax.tick_params(axis="x", labelsize=8)
-    plt.tight_layout()
-    fig.savefig(out("diag_loss_modes.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return results
-
-
-# ─── Plot 4: Reconstruction Ramachandran ─────────────────────────────────────
+# ─── Plot 2: Reconstruction Ramachandran ─────────────────────────────────────
 
 @torch.no_grad()
 def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
@@ -309,12 +200,12 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
     hex_kw = dict(gridsize=60, cmap="Blues", extent=[-180, 180, -180, 180], mincnt=1)
     ref_kw = dict(color="gray", lw=0.6, ls="--")
 
+    hb_list = []
     for ax, phi, psi, title in [
         (axes[0], real_phi, real_psi, "Real angles"),
         (axes[1], pred_phi, pred_psi, "Reconstructed angles"),
     ]:
         hb = ax.hexbin(phi, psi, **hex_kw)
-        fig.colorbar(hb, ax=ax, label="Count")
         ax.axhline(0, **ref_kw)
         ax.axvline(0, **ref_kw)
         ax.set_xlim(-180, 180)
@@ -322,6 +213,14 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
         ax.set_xlabel("φ (°)")
         ax.set_ylabel("ψ (°)")
         ax.set_title(title, fontsize=10, fontweight="bold")
+        hb_list.append((hb, ax))
+
+    counts = np.concatenate([hb.get_array() for hb, _ in hb_list])
+    counts = counts[counts > 0]
+    norm = LogNorm(vmin=counts.min(), vmax=counts.max())
+    for hb, ax in hb_list:
+        hb.set_norm(norm)
+        fig.colorbar(hb, ax=ax, label="Count (log scale)")
 
     plt.tight_layout()
     fig.savefig(out("diag_reconstruction_ramachandran.png"), dpi=150, bbox_inches="tight")
@@ -330,7 +229,7 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
     return mae_phi, mae_psi
 
 
-# ─── Plot 5: Generated Ramachandran ──────────────────────────────────────────
+# ─── Plot 3: Generated Ramachandran ──────────────────────────────────────────
 
 @torch.no_grad()
 def plot_generated_ramachandran(vae, val_loader, device):
@@ -382,12 +281,12 @@ def plot_generated_ramachandran(vae, val_loader, device):
     hex_kw = dict(gridsize=60, cmap="Blues", extent=[-180, 180, -180, 180], mincnt=1)
     ref_kw = dict(color="gray", lw=0.6, ls="--")
 
+    hb_list = []
     for ax, phi, psi, title in [
         (axes[0], real_phi, real_psi, "Real angles"),
         (axes[1], gen_phi,  gen_psi,  "Generated angles  (z ~ MAF prior)"),
     ]:
         hb = ax.hexbin(phi, psi, **hex_kw)
-        fig.colorbar(hb, ax=ax, label="Count")
         ax.axhline(0, **ref_kw)
         ax.axvline(0, **ref_kw)
         ax.set_xlim(-180, 180)
@@ -395,6 +294,14 @@ def plot_generated_ramachandran(vae, val_loader, device):
         ax.set_xlabel("φ (°)")
         ax.set_ylabel("ψ (°)")
         ax.set_title(title, fontsize=10, fontweight="bold")
+        hb_list.append((hb, ax))
+
+    counts = np.concatenate([hb.get_array() for hb, _ in hb_list])
+    counts = counts[counts > 0]
+    norm = LogNorm(vmin=counts.min(), vmax=counts.max())
+    for hb, ax in hb_list:
+        hb.set_norm(norm)
+        fig.colorbar(hb, ax=ax, label="Count (log scale)")
 
     plt.tight_layout()
     fig.savefig(out("diag_generated_ramachandran.png"), dpi=150, bbox_inches="tight")
@@ -403,10 +310,68 @@ def plot_generated_ramachandran(vae, val_loader, device):
     return w1_phi, w1_psi
 
 
+# ─── Plot 4: Kappa (concentration) distribution ──────────────────────────────
+
+@torch.no_grad()
+def plot_kappa_distribution(vae, val_loader, device, beta):
+    """Histogram of decoder kappa values."""
+    vae.eval()
+    kappas = []
+
+    for x, lengths in val_loader:
+        x, lengths = x.to(device), lengths.to(device)
+        guide_trace = pyro.poutine.trace(vae.guide).get_trace(x, lengths, beta)
+        mu_z = guide_trace.nodes["z"]["fn"].base_dist.loc
+        _, kappa_x = vae.decode(mu_z, x.shape[1])
+        mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
+        kappas.append(kappa_x[mask.unsqueeze(-1).expand_as(kappa_x)].cpu())
+
+    kappas = torch.cat(kappas).numpy()
+    angle_names = ["φ", "ψ"] if N_ANGLES == 2 else [f"angle {i}" for i in range(N_ANGLES)]
+
+    print(f"kappa configured min: {MIN_KAPPA:.4f}")
+    print(f"kappa configured max: {MAX_KAPPA:.4f}")
+    print(f"kappa actual min    : {kappas.min():.4f}")
+    print(f"kappa actual max    : {kappas.max():.4f}")
+    print(f"kappa mean          : {kappas.mean():.4f}")
+    print(f"kappa std           : {kappas.std():.4f}")
+    print(f"kappa median        : {np.median(kappas):.4f}")
+
+    fig, axes = plt.subplots(1, N_ANGLES, figsize=(6 * N_ANGLES, 4), squeeze=False)
+
+    for i, (ax, name) in enumerate(zip(axes[0], angle_names)):
+        vals = kappas[i::N_ANGLES] if kappas.ndim == 1 else kappas[:, i]
+        ax.hist(vals, bins=60, color="steelblue", edgecolor="none", alpha=0.7)
+        ax.axvline(vals.mean(), color="crimson", linewidth=1.2,
+                   label=f"mean={vals.mean():.2f}")
+        ax.axvline(MIN_KAPPA, color="orange", linewidth=1.2, linestyle="--",
+                   label=f"configured min={MIN_KAPPA:.1f}")
+        ax.axvline(MAX_KAPPA, color="purple", linewidth=1.2, linestyle="--",
+                   label=f"configured max={MAX_KAPPA:.1f}")
+        ax.set_xlabel("κ (concentration)")
+        ax.set_ylabel("count")
+        ax.set_title(f"Decoder κ — {name}")
+        ax.legend(fontsize=9)
+
+    fig.suptitle(
+        f"Von Mises decoder concentration (val set)\n"
+        f"Configured range: [{MIN_KAPPA:.1f}, {MAX_KAPPA:.1f}]  |  "
+        f"Actual range: [{kappas.min():.2f}, {kappas.max():.2f}]",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    fig.savefig(out("diag_kappa_dist.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Diag 6] configured κ: [{MIN_KAPPA:.1f}, {MAX_KAPPA:.1f}]  "
+          f"actual κ: [{kappas.min():.4f}, {kappas.max():.4f}]  "
+          f"mean={kappas.mean():.4f}  median={np.median(kappas):.4f}")
+    return kappas
+
+
 # ─── Text report ─────────────────────────────────────────────────────────────
 
-def write_report(active, kl_mean, loss_results, mae_phi, mae_psi,
-                 ckpt, wasserstein_dists, w1_phi_gen, w1_psi_gen):
+def write_report(active, kl_mean, mae_phi, mae_psi,
+                 ckpt, w1_phi_gen, w1_psi_gen, kappas=None):
     lines = []
     sep = "=" * 60
 
@@ -418,17 +383,13 @@ def write_report(active, kl_mean, loss_results, mae_phi, mae_psi,
         flag = "✓" if kl > ACTIVE_UNIT_THRESHOLD else "✗ COLLAPSED"
         lines.append(f"    dim {d:2d}: KL = {kl:.4f} nats  {flag}")
 
-    lines += ["", "2. TRAIN vs VAL LOSS BREAKDOWN", "-" * 40]
-    for label, val in loss_results.items():
-        lines.append(f"  {label}: {val:.4f}")
-
-    lines += ["", "3. RECONSTRUCTION QUALITY", "-" * 40]
+    lines += ["", "2. RECONSTRUCTION QUALITY", "-" * 40]
     lines += [f"  Circular MAE φ : {mae_phi:.2f}°",
               f"  Circular MAE ψ : {mae_psi:.2f}°",
               f"  Random baseline: ~90° (uniform distribution)",
               f"  Perfect model  : 0°"]
 
-    lines += ["", "4. DIAGNOSIS SUMMARY", "-" * 40]
+    lines += ["", "3. DIAGNOSIS SUMMARY", "-" * 40]
     if active < LATENT_DIM // 2:
         lines.append("  ⚠ POSTERIOR COLLAPSE detected — most latent dims inactive.")
         lines.append("    Suggestions:")
@@ -439,42 +400,7 @@ def write_report(active, kl_mean, loss_results, mae_phi, mae_psi,
     else:
         lines.append("  ✓ No collapse — majority of latent dims are active.")
 
-    tv_eval_gap = loss_results["Val / eval_mode "] \
-                - loss_results["Train / eval_mode "]
-    if abs(tv_eval_gap) < 0.05 * abs(loss_results["Train / eval_mode "]):
-        lines.append("  ✓ Train ≈ Val in eval mode → no overfitting.")
-    elif tv_eval_gap < -0.05:
-        lines.append("  ⚠ Val < Train in eval mode — possible data leakage or")
-        lines.append("    val set is easier than train set.")
-
-    lines += ["", "5. AGGREGATE POSTERIOR", "-" * 40]
-    n_holes = (wasserstein_dists > POSTERIOR_HOLE_THRESHOLD).sum()
-    lines += [f"  Wasserstein-1 distance to N(0,1) per dimension "
-              f"(threshold = {POSTERIOR_HOLE_THRESHOLD}):"]
-    for d, w in enumerate(wasserstein_dists):
-        flag = "  ← POTENTIAL HOLE" if w > POSTERIOR_HOLE_THRESHOLD else ""
-        lines.append(f"    dim {d:2d}: W1 = {w:.4f}{flag}")
-
-    lines += ["", f"  Dimensions flagged as potential holes: {n_holes}/{LATENT_DIM}"]
-
-    top5_idx = np.argsort(wasserstein_dists)[::-1][:5]
-    lines += ["", "  Top 5 most deviant dimensions:"]
-    for rank, d in enumerate(top5_idx):
-        lines.append(f"    #{rank+1}: dim {d:2d}  W1 = {wasserstein_dists[d]:.4f}")
-
-    if n_holes > 0:
-        lines += ["",
-                  "  ⚠ Posterior hole(s) detected — the aggregate posterior is not",
-                  "    covering the prior. Encoder is placing mass in a sub-region,",
-                  "    leaving most of the prior empty (holes).",
-                  "    Suggestions:",
-                  "    • Increase beta or slow down KL annealing to spread the posterior",
-                  "    • Add an MMD or aggregate posterior regulariser",
-                  "    • Inspect diag_aggregate_posterior.png for affected dims"]
-    else:
-        lines.append("  ✓ No posterior holes detected — aggregate posterior ≈ N(0,1).")
-
-    lines += ["", "6. GENERATION QUALITY", "-" * 40]
+    lines += ["", "4. GENERATION QUALITY", "-" * 40]
     lines += ["  Wasserstein-1 (real vs generated angle distribution, z ~ MAF prior):"]
     lines += [f"    φ: {w1_phi_gen:.3f}°",
               f"    ψ: {w1_psi_gen:.3f}°",
@@ -486,6 +412,29 @@ def write_report(active, kl_mean, loss_results, mae_phi, mae_psi,
         lines.append("    Suggestions:")
         lines.append("    • Check for posterior holes (see section 5)")
         lines.append("    • Increase training epochs or lower beta_max")
+
+    lines += ["", "5. KAPPA (VON MISES CONCENTRATION)", "-" * 40]
+    lines += [f"  Configured range : [{MIN_KAPPA:.4f}, {MAX_KAPPA:.4f}]"]
+    if kappas is not None:
+        lines += [
+            f"  Actual min       : {kappas.min():.4f}",
+            f"  Actual max       : {kappas.max():.4f}",
+            f"  Actual mean      : {kappas.mean():.4f}",
+            f"  Actual median    : {np.median(kappas):.4f}",
+            f"  Actual std       : {kappas.std():.4f}",
+        ]
+        pct_lo = 100.0 * (kappas < MIN_KAPPA + 0.5).mean()
+        pct_hi = 100.0 * (kappas > MAX_KAPPA - 0.5).mean()
+        lines += [
+            f"  % near configured min (< {MIN_KAPPA + 0.5:.1f}): {pct_lo:.1f}%",
+            f"  % near configured max (> {MAX_KAPPA - 0.5:.1f}): {pct_hi:.1f}%",
+        ]
+        if pct_hi > 10:
+            lines.append("  ⚠ Many kappas near the ceiling — decoder may be overconfident;"
+                         " consider raising MAX_KAPPA.")
+        if pct_lo > 10:
+            lines.append("  ⚠ Many kappas near the floor — decoder may be underconfident;"
+                         " consider lowering MIN_KAPPA.")
 
     lines += ["", sep, "END OF REPORT", sep]
 
@@ -547,15 +496,12 @@ def main():
     mu_z = torch.cat([mu_tr, mu_va])
     lv_z = torch.cat([lv_tr, lv_va])
 
-    active, kl_mean   = plot_kl_per_dim(mu_z, lv_z)
-    wasserstein_dists = plot_aggregate_posterior(
-        mu_z, os.path.join(OUT_DIR, "diag_aggregate_posterior.png")
-    )
-    loss_results          = plot_loss_modes(vae, train_loader, val_loader, device, beta)
-    mae_phi, mae_psi      = plot_reconstruction_ramachandran(vae, val_loader, device, beta)
-    w1_phi_gen, w1_psi_gen = plot_generated_ramachandran(vae, val_loader, device)
-    write_report(active, kl_mean, loss_results, mae_phi, mae_psi, ckpt, wasserstein_dists,
-                 w1_phi_gen, w1_psi_gen)
+    active, kl_mean          = plot_kl_per_dim(mu_z, lv_z)
+    mae_phi, mae_psi         = plot_reconstruction_ramachandran(vae, val_loader, device, beta)
+    w1_phi_gen, w1_psi_gen   = plot_generated_ramachandran(vae, val_loader, device)
+    kappas = plot_kappa_distribution(vae, val_loader, device, beta)
+    write_report(active, kl_mean, mae_phi, mae_psi, ckpt,
+                 w1_phi_gen, w1_psi_gen, kappas=kappas)
 
     print(f"\nAll outputs → {OUT_DIR}/")
 
