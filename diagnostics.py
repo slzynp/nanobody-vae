@@ -10,7 +10,6 @@ Run after training:  python diagnostics.py
 Outputs:
   diag_kl_per_dim.png                    per-dimension KL and active-unit count
   diag_aggregate_posterior.png           aggregate posterior vs N(0,1) prior (hole diagnosis)
-  diag_loss_modes.png                    train vs val loss in train-mode vs eval-mode
   diag_reconstruction_ramachandran.png   real vs reconstructed φ/ψ Ramachandran density
   diag_generated_ramachandran.png        real vs prior-sampled generated φ/ψ Ramachandran density
   diag_report.txt                        numerical summary
