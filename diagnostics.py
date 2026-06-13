@@ -16,6 +16,7 @@ Outputs:
 """
 
 import os
+import json
 import argparse
 import numpy as np
 import pandas as pd
@@ -28,6 +29,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.stats import wasserstein_distance, norm as scipy_norm
 from matplotlib.colors import LogNorm
+
+from rama_eval import eval_rama_quality
 
 from vae_svi import (
     NanobodyVAE, NanobodyDataset,
@@ -44,20 +47,40 @@ def out(name):
     return os.path.join(OUT_DIR, name)
 
 
+VAE_TYPE = 'svi'
+
+
 def _latest_run():
-    """Find the latest run directory in experiments/ by modified time, containing a checkpoint."""
+    """Find the latest run directory produced by vae_svi.py, identified by vae_type in config.json."""
     exp_dir = 'experiments'
     if not os.path.isdir(exp_dir):
-        raise FileNotFoundError("No 'experiments/' directory. Run vae.py first.")
-    runs = [
+        raise FileNotFoundError("No 'experiments/' directory. Run vae_svi.py first.")
+    all_runs = [
         d for d in os.listdir(exp_dir)
         if os.path.isdir(os.path.join(exp_dir, d))
         and os.path.exists(os.path.join(exp_dir, d, 'vae_checkpoint.pt'))
     ]
-    if not runs:
-        raise FileNotFoundError("No checkpoint found in experiments/. Run vae.py first.")
-    runs.sort(key=lambda d: os.path.getmtime(os.path.join(exp_dir, d)))
-    return runs[-1]
+    if not all_runs:
+        raise FileNotFoundError("No checkpoint found in experiments/. Run vae_svi.py first.")
+
+    tagged = []
+    for d in all_runs:
+        try:
+            with open(os.path.join(exp_dir, d, 'config.json')) as f:
+                if json.load(f).get('vae_type') == VAE_TYPE:
+                    tagged.append(d)
+        except Exception:
+            pass
+
+    if tagged:
+        tagged.sort(key=lambda d: os.path.getmtime(os.path.join(exp_dir, d)))
+        return tagged[-1]
+
+    print(f"WARNING: No runs tagged vae_type='{VAE_TYPE}'. "
+          "Falling back to latest run — may be from a different VAE. "
+          "Re-run vae_svi.py to get a properly tagged experiment.")
+    all_runs.sort(key=lambda d: os.path.getmtime(os.path.join(exp_dir, d)))
+    return all_runs[-1]
 
 
 # ─── Load model ──────────────────────────────────────────────────────────────
@@ -160,39 +183,43 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
     latent code for reconstruction, matching how the ELBO is evaluated.
     """
     vae.eval()
-    real_phi, real_psi, pred_phi, pred_psi = [], [], [], []
+    real_phi, real_psi, det_phi, det_psi, samp_phi, samp_psi = [], [], [], [], [], []
 
     for x, lengths in val_loader:
         x, lengths = x.to(device), lengths.to(device)
         guide_trace = pyro.poutine.trace(vae.guide).get_trace(x, lengths, beta)
-        # Use posterior mean for deterministic reconstruction
         mu_z = guide_trace.nodes["z"]["fn"].base_dist.loc
-        mu_x, _ = vae.decode(mu_z, x.shape[1])
+        mu_x, kappa_x = vae.decode(mu_z, x.shape[1])
+        sampled = dist.VonMises(mu_x, kappa_x).sample()
 
         for b in range(x.shape[0]):
             L = lengths[b].item()
             real_phi.extend(x[b, :L, 0].cpu().numpy())
             real_psi.extend(x[b, :L, 1].cpu().numpy())
-            pred_phi.extend(mu_x[b, :L, 0].detach().cpu().numpy())
-            pred_psi.extend(mu_x[b, :L, 1].detach().cpu().numpy())
+            det_phi.extend(mu_x[b, :L, 0].detach().cpu().numpy())
+            det_psi.extend(mu_x[b, :L, 1].detach().cpu().numpy())
+            samp_phi.extend(sampled[b, :L, 0].cpu().numpy())
+            samp_psi.extend(sampled[b, :L, 1].cpu().numpy())
 
     real_phi = np.degrees(real_phi)
     real_psi = np.degrees(real_psi)
-    pred_phi = np.degrees(pred_phi)
-    pred_psi = np.degrees(pred_psi)
+    det_phi  = np.degrees(det_phi)
+    det_psi  = np.degrees(det_psi)
+    samp_phi = np.degrees(samp_phi)
+    samp_psi = np.degrees(samp_psi)
 
     def circ_mae(a, b):
         d = np.abs(np.degrees(np.arctan2(np.sin(np.radians(a - b)),
                                           np.cos(np.radians(a - b)))))
         return float(d.mean())
 
-    mae_phi = circ_mae(real_phi, pred_phi)
-    mae_psi = circ_mae(real_psi, pred_psi)
+    mae_phi = circ_mae(real_phi, det_phi)
+    mae_psi = circ_mae(real_psi, det_psi)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
     fig.suptitle(
-        f"Reconstruction Ramachandran Plot (val set, dropout OFF, posterior mean)\n"
-        f"Circular MAE — φ: {mae_phi:.1f}°   ψ: {mae_psi:.1f}°",
+        f"Reconstruction Ramachandran Plot (val set, posterior mean z)\n"
+        f"Deterministic MAE — φ: {mae_phi:.1f}°   ψ: {mae_psi:.1f}°",
         fontsize=11, fontweight="bold",
     )
 
@@ -202,7 +229,8 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
     hb_list = []
     for ax, phi, psi, title in [
         (axes[0], real_phi, real_psi, "Real angles"),
-        (axes[1], pred_phi, pred_psi, "Reconstructed angles"),
+        (axes[1], det_phi,  det_psi,  "Reconstructed — μ_x (deterministic)"),
+        (axes[2], samp_phi, samp_psi, "Reconstructed — VM(μ_x, κ_x) sample"),
     ]:
         hb = ax.hexbin(phi, psi, **hex_kw)
         ax.axhline(0, **ref_kw)
@@ -224,8 +252,20 @@ def plot_reconstruction_ramachandran(vae, val_loader, device, beta):
     plt.tight_layout()
     fig.savefig(out("diag_reconstruction_ramachandran.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    rama_q_recon = eval_rama_quality(
+        real_phi, real_psi,
+        recon_det_phi=det_phi,   recon_det_psi=det_psi,
+        recon_samp_phi=samp_phi, recon_samp_psi=samp_psi,
+    )
+    m_det  = rama_q_recon["recon_det"]
+    m_samp = rama_q_recon["recon_samp"]
     print(f"[Diag 4] Ramachandran MAE — φ: {mae_phi:.1f}°  ψ: {mae_psi:.1f}°")
-    return mae_phi, mae_psi
+    print(f"[Diag 4] Density (det)  — JS-div={m_det['js_divergence']:.4f}  "
+          f"Hellinger={m_det['hellinger']:.4f}  overlap={m_det['overlap']:.4f}")
+    print(f"[Diag 4] Density (samp) — JS-div={m_samp['js_divergence']:.4f}  "
+          f"Hellinger={m_samp['hellinger']:.4f}  overlap={m_samp['overlap']:.4f}")
+    return mae_phi, mae_psi, rama_q_recon
 
 
 # ─── Plot 3: Generated Ramachandran ──────────────────────────────────────────
@@ -305,8 +345,13 @@ def plot_generated_ramachandran(vae, val_loader, device):
     plt.tight_layout()
     fig.savefig(out("diag_generated_ramachandran.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    rama_q_gen = eval_rama_quality(real_phi, real_psi, gen_phi=gen_phi, gen_psi=gen_psi)
+    m_gen = rama_q_gen["generated"]
     print(f"[Diag 5] Generated Ramachandran W1 — φ: {w1_phi:.3f}  ψ: {w1_psi:.3f}")
-    return w1_phi, w1_psi
+    print(f"[Diag 5] Density (gen) — JS-div={m_gen['js_divergence']:.4f}  "
+          f"Hellinger={m_gen['hellinger']:.4f}  overlap={m_gen['overlap']:.4f}")
+    return w1_phi, w1_psi, rama_q_gen
 
 
 # ─── Plot 4: Kappa (concentration) distribution ──────────────────────────────
@@ -370,7 +415,8 @@ def plot_kappa_distribution(vae, val_loader, device, beta):
 # ─── Text report ─────────────────────────────────────────────────────────────
 
 def write_report(active, kl_mean, mae_phi, mae_psi,
-                 ckpt, w1_phi_gen, w1_psi_gen, kappas=None):
+                 ckpt, w1_phi_gen, w1_psi_gen, kappas=None,
+                 rama_q_recon=None, rama_q_gen=None):
     lines = []
     sep = "=" * 60
 
@@ -435,6 +481,24 @@ def write_report(active, kl_mean, mae_phi, mae_psi,
             lines.append("  ⚠ Many kappas near the floor — decoder may be underconfident;"
                          " consider lowering MIN_KAPPA.")
 
+    lines += ["", "6. RAMACHANDRAN DENSITY SIMILARITY", "-" * 40]
+    lines += ["  (JS divergence in [0,1]: 0=identical; Hellinger in [0,1]: 0=identical; overlap in [0,1]: 1=identical)"]
+
+    def _fmt_rama(m):
+        return (f"    JS-div={m['js_divergence']:.4f}  JS-dist={m['js_distance']:.4f}  "
+                f"Hellinger={m['hellinger']:.4f}  overlap={m['overlap']:.4f}")
+
+    if rama_q_recon:
+        lines.append("  Reconstruction vs real:")
+        if "recon_det" in rama_q_recon:
+            lines.append(f"    deterministic (μ_x):  {_fmt_rama(rama_q_recon['recon_det'])}")
+        if "recon_samp" in rama_q_recon:
+            lines.append(f"    stochastic sample:    {_fmt_rama(rama_q_recon['recon_samp'])}")
+    if rama_q_gen:
+        lines.append("  Generation vs real:")
+        if "generated" in rama_q_gen:
+            lines.append(f"    generated (z~prior):  {_fmt_rama(rama_q_gen['generated'])}")
+
     lines += ["", sep, "END OF REPORT", sep]
 
     path = out("diag_report.txt")
@@ -472,7 +536,6 @@ def main():
 
     config_path = os.path.join(run_dir, 'config.json')
     if os.path.exists(config_path):
-        import json
         with open(config_path) as f:
             cfg = json.load(f)
         warmup_epochs = cfg.get('warmup_epochs', 70)
@@ -495,12 +558,13 @@ def main():
     mu_z = torch.cat([mu_tr, mu_va])
     lv_z = torch.cat([lv_tr, lv_va])
 
-    active, kl_mean          = plot_kl_per_dim(mu_z, lv_z)
-    mae_phi, mae_psi         = plot_reconstruction_ramachandran(vae, val_loader, device, beta)
-    w1_phi_gen, w1_psi_gen   = plot_generated_ramachandran(vae, val_loader, device)
+    active, kl_mean                        = plot_kl_per_dim(mu_z, lv_z)
+    mae_phi, mae_psi, rama_q_recon         = plot_reconstruction_ramachandran(vae, val_loader, device, beta)
+    w1_phi_gen, w1_psi_gen, rama_q_gen     = plot_generated_ramachandran(vae, val_loader, device)
     kappas = plot_kappa_distribution(vae, val_loader, device, beta)
     write_report(active, kl_mean, mae_phi, mae_psi, ckpt,
-                 w1_phi_gen, w1_psi_gen, kappas=kappas)
+                 w1_phi_gen, w1_psi_gen, kappas=kappas,
+                 rama_q_recon=rama_q_recon, rama_q_gen=rama_q_gen)
 
     print(f"\nAll outputs → {OUT_DIR}/")
 
