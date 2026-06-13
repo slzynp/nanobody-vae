@@ -18,7 +18,7 @@ import importlib.util
 if importlib.util.find_spec("umap") is None:
     raise ImportError("Run: pip install umap-learn")
 
-from vae import NanobodyVAE, NanobodyDataset, collate_fn, MAX_LEN, N_ANGLES, HIDDEN_DIM, LATENT_DIM
+from vae_svi import NanobodyVAE, NanobodyDataset, collate_fn, MAX_LEN, N_ANGLES, HIDDEN_DIM, LATENT_DIM
 
 # ============================================================================
 # CONFIG
@@ -61,9 +61,13 @@ def load_model(checkpoint_path, device):
         latent_dim=LATENT_DIM, device=device
     ).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    vae.load_state_dict(ckpt['model'])
+    missing, unexpected = vae.load_state_dict(ckpt['model'], strict=False)
     vae.eval()
     print(f"Loaded checkpoint from epoch {ckpt['epoch']+1}")
+    if missing:
+        print(f"  Note: {len(missing)} keys not in checkpoint (prior weights — not needed for encoding)")
+    if unexpected:
+        print(f"  Warning: {len(unexpected)} unexpected keys in checkpoint: {unexpected}")
 
     train_indices = ckpt.get('train_indices')
     val_indices   = ckpt.get('val_indices')
@@ -437,7 +441,7 @@ def compute_per_sequence_loss(vae, dataset, device, batch_size=64):
             mask = (torch.arange(seq_len, device=device)[None, :]
                     < seq_lengths[:, None]).float().unsqueeze(-1)
             recon   = dist_mod.VonMises(mu_x, kappa_x).log_prob(x) * mask
-            per_seq = recon.sum(dim=[1, 2]) / seq_lengths.float()
+            per_seq = -recon.sum(dim=[1, 2]) / seq_lengths.float()
             all_recon.append(per_seq.cpu())
 
     return torch.cat(all_recon).numpy()
@@ -451,7 +455,7 @@ def plot_outlier_spike(embedding, recon_loss, df, outlier_indices,
 
     ax = axes[0]
     sc = ax.scatter(embedding[:, 0], embedding[:, 1],
-                    c=recon_loss, cmap='RdYlGn', s=10, alpha=0.8, rasterized=True)
+                    c=recon_loss, cmap='RdYlGn_r', s=10, alpha=0.8, rasterized=True)
     plt.colorbar(sc, ax=ax, label='Recon loss (lower = better)')
     for rank, idx in enumerate(outlier_indices):
         ax.scatter(embedding[idx, 0], embedding[idx, 1],
