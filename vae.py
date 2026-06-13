@@ -27,11 +27,11 @@ MAX_LEN    = 80
 N_ANGLES   = 2
 HIDDEN_DIM = 64
 LATENT_DIM = 32
-MIN_KAPPA = 40.0  # minimum concentration for Von Mises distribution
-MAX_KAPPA = 400.0 # maximum concentration for Von Mises distribution
-
+MIN_KAPPA = 5.0  # minimum concentration for Von Mises distribution
+MAX_KAPPA = 50.0 # maximum concentration for Von Mises distribution
+SEED = 42
 # ============================================================================
-# VAE MODEL  —  Gaussian prior + posterior, Von Mises likelihood
+# VAE MODEL  —  MAF prior + Gaussian posterior, Von Mises likelihood
 # ============================================================================
 
 class NanobodyVAE(nn.Module):
@@ -66,7 +66,7 @@ class NanobodyVAE(nn.Module):
         self.fc_out       = nn.Linear(hidden_dim, input_dim)
         self.fc_kappa_out = nn.Linear(hidden_dim, input_dim)
 
-        # PRIOR: learnable MAF flow p(z)
+        # PRIOR: MAF flow p(z), PYRO's implementation 
         self.prior = zuko.flows.MAF(
             features=latent_dim,
             hidden_features=[hidden_dim, hidden_dim],
@@ -77,7 +77,7 @@ class NanobodyVAE(nn.Module):
         packed = pack_padded_sequence(x, seq_lengths.cpu(),
                                       batch_first=True, enforce_sorted=False)
         _, h = self.encoder_rnn(packed)
-        h    = h.squeeze(0)
+        h    = h.squeeze(0) 
         return self.fc_mu(h), self.fc_log_var(h)
 
     def decode(self, z, seq_len):
@@ -94,9 +94,9 @@ class NanobodyVAE(nn.Module):
         pyro.module("nanobody_vae", self)
         batch_size, seq_len, _ = x.shape
 
-        with pyro.plate("data", batch_size):
-            with pyro.poutine.scale(scale=beta):
-                z = pyro.sample("z", ZukoToPyro(self.prior()))
+        with pyro.plate("data", batch_size): ## independence over sequences
+            with pyro.poutine.scale(scale=beta): ## anneal KL term 
+                z = pyro.sample("z", ZukoToPyro(self.prior())) ## sample z from the MAF prior flow 
 
             mu_x, kappa_x = self.decode(z, seq_len)
             mask = (torch.arange(seq_len, device=x.device)[None, :]
@@ -152,13 +152,13 @@ class NanobodyVAE(nn.Module):
 # BETA-ANNEALING SCHEDULE
 # ============================================================================
 
-def get_beta_schedule(epoch, warmup_epochs=70, anneal_end=200, max_beta=0.01):
+def get_beta_schedule(epoch, warmup_epochs=70, anneal_end=200, max_beta=0.1):
     """beta-annealing: warm-up → gradual increase → plateau."""
     if epoch < warmup_epochs:
-        return 1e-4    
+        return 1e-3   
     elif epoch < anneal_end:
         progress = (epoch - warmup_epochs) / (anneal_end - warmup_epochs)
-        return 1e-4 + progress * (max_beta - 1e-4)
+        return 1e-3 + progress * (max_beta - 1e-3)
     else:
         return max_beta
 
@@ -193,7 +193,7 @@ class NanobodyDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.angles[idx],
 
-    def create_train_val_split(self, val_fraction=0.2, random_seed=42):
+    def create_train_val_split(self, val_fraction=0.2, random_seed=SEED):
         np.random.seed(random_seed)
         indices = np.random.permutation(len(self.data))
         split   = int(len(self.data) * (1 - val_fraction))
@@ -214,8 +214,7 @@ def train_vae(vae, train_loader, val_loader,
               epochs=200, device='cpu',
               train_indices=None, val_indices=None,
               warmup_epochs=70, anneal_end=200, max_beta=0.01,
-              lr=5e-4, weight_decay=1e-5, save_dir='.',
-              patience=50):
+              lr=5e-4, weight_decay=1e-5, save_dir='.'):
 
     print(f"\n{'='*70}")
     print("TRAINING NANOBODY VAE  (SVI, Trace_ELBO, Von Mises likelihood)")
@@ -232,9 +231,8 @@ def train_vae(vae, train_loader, val_loader,
 
     train_losses, val_losses, kl_values, beta_values, recon_losses = [], [], [], [], []
 
-    best_val_loss    = float('inf')
-    best_epoch       = 0
-    patience_counter = 0
+    best_val_loss = float('inf')
+    best_epoch    = 0
 
     for epoch in range(epochs):
         beta = get_beta_schedule(epoch, warmup_epochs=warmup_epochs,
@@ -292,9 +290,8 @@ def train_vae(vae, train_loader, val_loader,
 
         # ─── CHECKPOINT ───
         if val_loss < best_val_loss:
-            best_val_loss    = val_loss
-            best_epoch       = epoch
-            patience_counter = 0
+            best_val_loss = val_loss
+            best_epoch    = epoch
             torch.save({
                 'model':         vae.state_dict(),
                 'epoch':         epoch,
@@ -306,12 +303,8 @@ def train_vae(vae, train_loader, val_loader,
             print(f"Epoch {epoch+1:3d}: train={train_loss:.4f}, val={val_loss:.4f}, "
                   f"kl={val_kl:.4f}, beta={beta:.4f} *")
         else:
-            patience_counter += 1
             print(f"Epoch {epoch+1:3d}: train={train_loss:.4f}, val={val_loss:.4f}, "
                   f"kl={val_kl:.4f}, beta={beta:.4f}")
-            if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {patience} epochs).")
-                break
 
     print(f"\n{'='*70}")
     print(f"TRAINING COMPLETE")
@@ -328,35 +321,42 @@ def train_vae(vae, train_loader, val_loader,
 # ============================================================================
 
 def plot_training_results(train_losses, val_losses, kl_values, beta_values, recon_losses,
-                          save_path="training_curves.png"):
+                          save_path="training_curves.png", max_epochs=3000):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     epochs = range(1, len(train_losses) + 1)
+    best_epoch = int(np.argmin(val_losses)) + 1
 
     axes[0, 0].plot(epochs, recon_losses, color='darkorange', linewidth=2, marker='o', markersize=4)
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('NLL (nats/residue)')
     axes[0, 0].set_title('Reconstruction Loss (Validation)')
+    axes[0, 0].set_xlim(1, best_epoch + 20)
     axes[0, 0].grid(alpha=0.3)
 
     axes[0, 1].plot(epochs, kl_values, 'g-', linewidth=2, marker='o', markersize=4)
     axes[0, 1].set_xlabel('Epoch'); axes[0, 1].set_ylabel('KL Divergence')
-    axes[0, 1].set_title('KL Divergence (Validation)'); axes[0, 1].grid(alpha=0.3)
+    axes[0, 1].set_title('KL Divergence (Validation)')
+    axes[0, 1].set_xlim(1, best_epoch + 20)
+    axes[0, 1].grid(alpha=0.3)
 
     axes[1, 0].plot(epochs, beta_values, color='purple', linewidth=2, marker='s', markersize=4)
     axes[1, 0].set_xlabel('Epoch'); axes[1, 0].set_ylabel('beta')
-    axes[1, 0].set_title('beta-Annealing Schedule'); axes[1, 0].grid(alpha=0.3)
+    axes[1, 0].set_title('beta-Annealing Schedule')
+    axes[1, 0].set_xlim(1, best_epoch + 20)
+    axes[1, 0].grid(alpha=0.3)
 
     axes[1, 1].plot(epochs, val_losses, 'r-', linewidth=2)
     axes[1, 1].fill_between(epochs, val_losses, alpha=0.2, color='red')
     axes[1, 1].set_xlabel('Epoch'); axes[1, 1].set_ylabel('Loss')
-    axes[1, 1].set_title('Validation Loss (Detailed)'); axes[1, 1].grid(alpha=0.3)
+    axes[1, 1].set_title('Validation Loss (ELBO)')
+    axes[1, 1].set_xlim(1, best_epoch + 20)
+    axes[1, 1].grid(alpha=0.3)
 
-    best_epoch = int(np.argmin(val_losses)) + 1
     for ax in axes.flat:
         ax.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7, linewidth=2,
                    label=f'Best (epoch {best_epoch})')
 
-    plt.suptitle('Nanobody VAE — SVI, Trace_ELBO, Von Mises likelihood',
+    plt.suptitle('Nanobody VAE Training Curves with MAF Prior' ,
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -369,23 +369,24 @@ def plot_training_results(train_losses, val_losses, kl_values, beta_values, reco
 # ============================================================================
 
 def main():
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
 
     latent_dim    = LATENT_DIM
     hidden_dim    = HIDDEN_DIM
-    warmup_epochs = 50
-    anneal_end    = 170
+    warmup_epochs = 200
+    anneal_end    = 1000
     max_beta      = 0.1
-    epochs        = 1500
-    patience      = 100
+    epochs        = 3000
     batch_size    = 32
     lr            = 5e-4
     weight_decay  = 1e-5
-
+    min_kappa      = MIN_KAPPA
+    max_kappa      = MAX_KAPPA
+    seed         = SEED
     timestamp = datetime.now().strftime('%Y%m%d')
     run_name  = f"run_{timestamp}_{secrets.token_hex(3)}"
     save_dir  = os.path.join('experiments', run_name)
@@ -393,16 +394,19 @@ def main():
     print(f"Run: {run_name}\n")
 
     config = {
+        'vae_type':      'svi',
         'latent_dim':    latent_dim,
         'hidden_dim':    hidden_dim,
         'warmup_epochs': warmup_epochs,
         'anneal_end':    anneal_end,
         'max_beta':      max_beta,
         'epochs':        epochs,
-        'patience':      patience,
         'batch_size':    batch_size,
         'lr':            lr,
         'weight_decay':  weight_decay,
+        'min_kappa':     min_kappa,
+        'max_kappa':     max_kappa,
+        'seed':         seed,
     }
     with open(os.path.join(save_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
@@ -433,12 +437,13 @@ def main():
         train_indices=train_indices, val_indices=val_indices,
         warmup_epochs=warmup_epochs, anneal_end=anneal_end, max_beta=max_beta,
         lr=lr, weight_decay=weight_decay,
-        save_dir=save_dir, patience=patience,
+        save_dir=save_dir,
     )
 
     plot_training_results(
         train_losses, val_losses, kl_values, beta_values, recon_losses,
         save_path=os.path.join(save_dir, 'training_curves.png'),
+        max_epochs=epochs,
     )
 
 
